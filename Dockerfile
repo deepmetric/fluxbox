@@ -4,6 +4,15 @@ FROM alpine:3.21
 #  - Xvfb + x11vnc  -> single TigerVNC Xvnc process (no screen scraping)
 #  - ffmpeg         -> parec + opusenc (much smaller, less RAM/CPU per listener)
 #  - bash           -> /bin/sh
+#
+# Flicker fixes in this revision:
+#  - default depth 16 -> 24 (Chromium software rendering is happier)
+#  - MIT-SHM disabled in Xvnc (shared-memory X11 often fails in sandboxed containers
+#    and shows up as a black/white window)
+#  - dropped --no-zygote / --renderer-process-limit / site-isolation overrides
+#  - GPU fully off (--disable-gpu-compositing) to stop the ANGLE/Vulkan init retries
+#  - noVNC auto-reconnect delay 1s -> 3s (a 1s reconnect loop looks like flashing)
+#  - supervisor restart delay 1s -> 3s, and crash-restore bubble suppressed
 RUN apk add --no-cache \
     tini \
     tigervnc \
@@ -98,10 +107,10 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 NOVNC_DIR = "/usr/share/novnc"
 PORT = int(os.environ.get("PORT", 8080))
-RES = os.environ.get("RESOLUTION", "800x480x16")
+RES = os.environ.get("RESOLUTION", "800x480x24")
 _p = RES.split("x")
 WIN_W, WIN_H = _p[0], _p[1]
-DEPTH = _p[2] if len(_p) > 2 else "16"
+DEPTH = _p[2] if len(_p) > 2 else "24"
 START_URL = os.environ.get("START_URL", "https://app.speechify.com")
 RATE = "24000"  # a native Opus rate -> no resampling
 
@@ -127,15 +136,19 @@ PROCS = [
         "-rfbport", "5900", "-rfbauth", "/root/.vnc/passwd",
         "-SecurityTypes", "VncAuth", "-localhost", "-AlwaysShared",
         "-FrameRate", "20", "-nolisten", "tcp",
+        # shared-memory X11 transport frequently breaks in sandboxed containers
+        # (gVisor etc.) and produces black/white windows; fall back to plain XPutImage
+        "-extension", "MIT-SHM",
         # every client arrives from 127.0.0.1 via websockify, so don't let one bad login lock out everyone
         "-BlacklistThreshold", "1000", "-BlacklistTimeout", "1",
     ], [], ["/tmp/.X0-lock", X_SOCK]),
     ("websockify", ["/usr/bin/websockify", "127.0.0.1:6080", "127.0.0.1:5900"], [], []),
     ("browser", [
         "/usr/bin/chromium-browser",
-        "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--in-process-gpu", "--no-zygote",
-        "--enable-low-end-device-mode",
-        "--renderer-process-limit=1",
+        "--no-sandbox", "--disable-dev-shm-usage",
+        "--ozone-platform=x11",
+        # software rendering only: no GPU process retries, no ANGLE/Vulkan init
+        "--disable-gpu", "--disable-gpu-compositing",
         "--autoplay-policy=no-user-gesture-required",
         "--disable-background-timer-throttling", "--disable-background-networking",
         "--disable-extensions", "--disable-sync", "--disable-translate",
@@ -143,9 +156,9 @@ PROCS = [
         "--disable-domain-reliability", "--metrics-recording-only",
         "--disable-smooth-scrolling", "--force-device-scale-factor=1",
         "--overscroll-history-navigation=0",
-        "--disable-features=Translate,BackForwardCache,MediaRouter,OptimizationHints,"
-        "CalculateNativeWinOcclusion,IsolateOrigins,site-per-process,AudioServiceOutOfProcess",
+        "--disable-features=Translate,MediaRouter,OptimizationHints,Vulkan",
         "--no-first-run", "--password-store=basic",
+        "--noerrdialogs", "--disable-session-crashed-bubble", "--hide-crash-restore-bubble",
         f"--user-data-dir={CHROME_DIR}",
         "--disk-cache-dir=/tmp/chromium-cache", "--disk-cache-size=10485760",
         "--window-position=0,0", f"--window-size={WIN_W},{WIN_H}",
@@ -174,13 +187,16 @@ def supervise(name, cmd, waits, stale):
             for f in glob.glob(pat):
                 try: os.remove(f)
                 except OSError: pass
+        started = time.time()
         p = subprocess.Popen(cmd, env=ENV)
         running.append(p)
-        p.wait()
+        rc = p.wait()
         if p in running:
             running.remove(p)
         if not stopping:
-            time.sleep(1)
+            print(f"[supervisor] {name} exited with code {rc} after {time.time() - started:.1f}s, restarting",
+                  flush=True)
+            time.sleep(3)
 
 
 def shutdown(signum, frame):
@@ -215,7 +231,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_response(302)
             self.send_header(
                 "Location",
-                "/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000&show_dot=true")
+                "/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=3000&show_dot=true")
             self.end_headers()
             return
 
@@ -252,7 +268,7 @@ class Handler(SimpleHTTPRequestHandler):
                     p.wait()
             return
 
-        if self.headers.get("Upgrade", "").lower() == "websocket":
+        if "websocket" in self.headers.get("Upgrade", "").lower():
             self.close_connection = True
             client = self.connection
             try:
@@ -289,7 +305,7 @@ class Handler(SimpleHTTPRequestHandler):
 ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 PYEOF
 
-ENV RESOLUTION=800x480x16 \
+ENV RESOLUTION=800x480x24 \
     PORT=8080 \
     VNC_PASSWORD=changeme \
     START_URL=https://app.speechify.com \
