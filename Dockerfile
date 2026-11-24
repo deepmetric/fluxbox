@@ -1,27 +1,36 @@
 FROM alpine:3.21
 
-# Install Xvfb, x11vnc, IceWM, noVNC, websockify, terminal, and supervisor
 RUN apk add --no-cache \
     xvfb \
     x11vnc \
-    icewm \
+    fluxbox \
     xterm \
+    falkon \
+    mesa-gl \
     novnc \
     websockify \
     supervisor \
     bash \
-    ttf-dejavu
+    ttf-dejavu \
+    font-noto
 
-# Redirect root path (/) directly to noVNC auto-connect UI
 RUN ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html
 
-# Default environment variables (Render overrides PORT automatically)
+RUN mkdir -p /root/.fluxbox && cat << 'EOF' > /root/.fluxbox/menu
+[begin] (Fluxbox)
+  [exec] (Falkon) {falkon --no-sandbox}
+  [exec] (Terminal) {xterm}
+  [restart] (Restart)
+  [exit] (Exit)
+[end]
+EOF
+
 ENV DISPLAY=:0 \
     RESOLUTION=1280x720x16 \
     PORT=8080 \
-    VNC_PASSWORD=changeme
+    VNC_PASSWORD=changeme \
+    START_URL=https://www.youtube.com
 
-# Create startup script to configure VNC password and launch supervisord
 RUN cat << 'EOF' > /entrypoint.sh
 #!/bin/bash
 set -e
@@ -41,7 +50,7 @@ autorestart=true
 priority=10
 
 [program:wm]
-command=/usr/bin/icewm-session
+command=/usr/bin/fluxbox
 environment=DISPLAY=":0"
 autorestart=true
 priority=20
@@ -55,6 +64,12 @@ priority=30
 command=/usr/bin/websockify --web=/usr/share/novnc/ ${PORT} localhost:5900
 autorestart=true
 priority=40
+
+[program:falkon]
+command=/usr/bin/falkon --no-sandbox ${START_URL}
+environment=DISPLAY=":0",HOME="/root",QTWEBENGINE_DISABLE_SANDBOX="1",QTWEBENGINE_CHROMIUM_FLAGS="--disable-dev-shm-usage --disable-gpu"
+autorestart=true
+priority=50
 CONF
 
 exec /usr/bin/supervisord -c /etc/supervisord.conf
