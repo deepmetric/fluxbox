@@ -7,9 +7,8 @@ RUN apk add --no-cache \
     xterm \
     epiphany \
     dbus-x11 \
+    gst-plugins-base \
     gst-plugins-good \
-    gst-plugins-bad \
-    gst-libav \
     novnc \
     websockify \
     supervisor \
@@ -21,7 +20,7 @@ RUN ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html
 
 RUN mkdir -p /root/.fluxbox && cat << 'EOF' > /root/.fluxbox/menu
 [begin] (Fluxbox)
-  [exec] (Browser) {WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 JSC_useJIT=false dbus-run-session epiphany https://m.youtube.com}
+  [exec] (Speechify) {WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 JSC_useJIT=false dbus-run-session epiphany https://app.speechify.com}
   [exec] (Terminal) {xterm}
   [restart] (Restart)
   [exit] (Exit)
@@ -32,7 +31,7 @@ ENV DISPLAY=:0 \
     RESOLUTION=1024x576x16 \
     PORT=8080 \
     VNC_PASSWORD=changeme \
-    START_URL=https://m.youtube.com
+    START_URL=https://app.speechify.com
 
 RUN cat << 'EOF' > /entrypoint.sh
 #!/bin/bash
