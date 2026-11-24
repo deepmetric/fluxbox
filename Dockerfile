@@ -5,10 +5,7 @@ RUN apk add --no-cache \
     x11vnc \
     fluxbox \
     xterm \
-    epiphany \
-    dbus-x11 \
-    gst-plugins-base \
-    gst-plugins-good \
+    chromium \
     novnc \
     websockify \
     supervisor \
@@ -20,7 +17,7 @@ RUN ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html
 
 RUN mkdir -p /root/.fluxbox && cat << 'EOF' > /root/.fluxbox/menu
 [begin] (Fluxbox)
-  [exec] (Speechify) {WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 JSC_useJIT=false dbus-run-session epiphany https://app.speechify.com}
+  [exec] (Speechify) {chromium-browser --no-sandbox --disable-dev-shm-usage --disable-gpu --single-process --js-flags="--max-old-space-size=160" https://app.speechify.com}
   [exec] (Terminal) {xterm}
   [restart] (Restart)
   [exit] (Exit)
@@ -37,7 +34,7 @@ RUN cat << 'EOF' > /entrypoint.sh
 #!/bin/bash
 set -e
 
-mkdir -p /root/.vnc /run/dbus
+mkdir -p /root/.vnc
 x11vnc -storepasswd "$VNC_PASSWORD" /root/.vnc/passwd
 
 cat << CONF > /etc/supervisord.conf
@@ -68,8 +65,8 @@ autorestart=true
 priority=40
 
 [program:browser]
-command=/usr/bin/dbus-run-session /usr/bin/epiphany ${START_URL}
-environment=DISPLAY=":0",HOME="/root",WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS="1",WEBKIT_DISABLE_COMPOSITING_MODE="1",JSC_useJIT="false",WEBKIT_FORCE_SANDBOX="0",G_SLICE="always-malloc",MALLOC_ARENA_MAX="2"
+command=/usr/bin/chromium-browser --no-sandbox --disable-dev-shm-usage --disable-gpu --no-zygote --renderer-process-limit=1 --js-flags="--max-old-space-size=160" ${START_URL}
+environment=DISPLAY=":0",HOME="/root",MALLOC_ARENA_MAX="2"
 autorestart=true
 priority=50
 CONF
