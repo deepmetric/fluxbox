@@ -117,7 +117,6 @@ PROCS = [
     ("pulseaudio", [
         "/usr/bin/pulseaudio", "-n", "--daemonize=no", "--exit-idle-time=-1",
         "--realtime=no", "--high-priority=no", "--disable-shm=yes",
-        f"--default-sample-rate={RATE}", "--default-sample-channels=1",
         "--resample-method=trivial",
         f"--load=module-native-protocol-unix socket={PULSE_SOCK} auth-anonymous=1",
         f"--load=module-null-sink sink_name=virtual_speaker rate={RATE} channels=1 "
@@ -128,6 +127,8 @@ PROCS = [
         "-rfbport", "5900", "-rfbauth", "/root/.vnc/passwd",
         "-SecurityTypes", "VncAuth", "-localhost", "-AlwaysShared",
         "-FrameRate", "20", "-nolisten", "tcp",
+        # every client arrives from 127.0.0.1 via websockify, so don't let one bad login lock out everyone
+        "-BlacklistThreshold", "1000", "-BlacklistTimeout", "1",
     ], [], ["/tmp/.X0-lock", X_SOCK]),
     ("websockify", ["/usr/bin/websockify", "127.0.0.1:6080", "127.0.0.1:5900"], [], []),
     ("browser", [
