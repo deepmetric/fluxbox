@@ -6,6 +6,7 @@ RUN apk add --no-cache \
     fluxbox \
     xterm \
     epiphany \
+    dbus-x11 \
     gst-plugins-good \
     gst-plugins-bad \
     gst-libav \
@@ -20,7 +21,7 @@ RUN ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html
 
 RUN mkdir -p /root/.fluxbox && cat << 'EOF' > /root/.fluxbox/menu
 [begin] (Fluxbox)
-  [exec] (Browser) {epiphany https://m.youtube.com}
+  [exec] (Browser) {WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 dbus-run-session epiphany https://m.youtube.com}
   [exec] (Terminal) {xterm}
   [restart] (Restart)
   [exit] (Exit)
@@ -37,7 +38,7 @@ RUN cat << 'EOF' > /entrypoint.sh
 #!/bin/bash
 set -e
 
-mkdir -p /root/.vnc
+mkdir -p /root/.vnc /run/dbus
 x11vnc -storepasswd "$VNC_PASSWORD" /root/.vnc/passwd
 
 cat << CONF > /etc/supervisord.conf
@@ -68,8 +69,8 @@ autorestart=true
 priority=40
 
 [program:browser]
-command=/usr/bin/epiphany ${START_URL}
-environment=DISPLAY=":0",HOME="/root",WEBKIT_DISABLE_COMPOSITING_MODE="1",G_SLICE="always-malloc",MALLOC_ARENA_MAX="2"
+command=/usr/bin/dbus-run-session /usr/bin/epiphany ${START_URL}
+environment=DISPLAY=":0",HOME="/root",WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS="1",WEBKIT_DISABLE_COMPOSITING_MODE="1",G_SLICE="always-malloc",MALLOC_ARENA_MAX="2"
 autorestart=true
 priority=50
 CONF
