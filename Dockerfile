@@ -5,8 +5,10 @@ RUN apk add --no-cache \
     x11vnc \
     fluxbox \
     xterm \
-    falkon \
-    mesa-gl \
+    epiphany \
+    gst-plugins-good \
+    gst-plugins-bad \
+    gst-libav \
     novnc \
     websockify \
     supervisor \
@@ -18,7 +20,7 @@ RUN ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html
 
 RUN mkdir -p /root/.fluxbox && cat << 'EOF' > /root/.fluxbox/menu
 [begin] (Fluxbox)
-  [exec] (Falkon) {falkon --no-sandbox}
+  [exec] (Browser) {epiphany https://m.youtube.com}
   [exec] (Terminal) {xterm}
   [restart] (Restart)
   [exit] (Exit)
@@ -26,10 +28,10 @@ RUN mkdir -p /root/.fluxbox && cat << 'EOF' > /root/.fluxbox/menu
 EOF
 
 ENV DISPLAY=:0 \
-    RESOLUTION=1280x720x16 \
+    RESOLUTION=1024x576x16 \
     PORT=8080 \
     VNC_PASSWORD=changeme \
-    START_URL=https://www.youtube.com
+    START_URL=https://m.youtube.com
 
 RUN cat << 'EOF' > /entrypoint.sh
 #!/bin/bash
@@ -65,9 +67,9 @@ command=/usr/bin/websockify --web=/usr/share/novnc/ ${PORT} localhost:5900
 autorestart=true
 priority=40
 
-[program:falkon]
-command=/usr/bin/falkon --no-sandbox ${START_URL}
-environment=DISPLAY=":0",HOME="/root",QTWEBENGINE_DISABLE_SANDBOX="1",QTWEBENGINE_CHROMIUM_FLAGS="--disable-dev-shm-usage --disable-gpu"
+[program:browser]
+command=/usr/bin/epiphany ${START_URL}
+environment=DISPLAY=":0",HOME="/root",WEBKIT_DISABLE_COMPOSITING_MODE="1",G_SLICE="always-malloc",MALLOC_ARENA_MAX="2"
 autorestart=true
 priority=50
 CONF
