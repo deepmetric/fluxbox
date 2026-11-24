@@ -1,113 +1,186 @@
 FROM alpine:3.21
 
+# Changes vs. original:
+#  - Xvfb + x11vnc  -> single TigerVNC Xvnc process (no screen scraping)
+#  - ffmpeg         -> parec + opusenc (much smaller, less RAM/CPU per listener)
+#  - bash           -> /bin/sh
 RUN apk add --no-cache \
     tini \
-    xvfb \
-    x11vnc \
+    tigervnc \
+    xkbcomp \
+    xkeyboard-config \
     chromium \
     pulseaudio \
     pulseaudio-utils \
-    ffmpeg \
+    opus-tools \
     python3 \
     novnc \
     websockify \
-    bash \
     ttf-dejavu \
     font-noto
 
-RUN cat << 'EOF' > /server.py
-import os, subprocess, threading, time, socket, select, signal, sys
+# ---------- Audio widget (static file, injected once at build time) ----------
+RUN cat << 'JSEOF' > /usr/share/novnc/audio.js
+(function () {
+  var KEY = 'vnc-audio-on';
+  var a = new Audio();
+  a.preload = 'none';
+  var on = false, retry = 0, timer = null;
+
+  var bar = document.createElement('div');
+  bar.style.cssText = 'position:fixed;bottom:10px;right:10px;z-index:9999;background:#1e1e1e;color:#fff;' +
+    'padding:6px 10px;border-radius:6px;font:13px sans-serif;box-shadow:0 2px 6px rgba(0,0,0,.4);' +
+    'display:flex;gap:8px;align-items:center;opacity:.85';
+  var btn = document.createElement('button');
+  btn.style.cssText = 'color:#fff;border:0;padding:4px 10px;border-radius:4px;cursor:pointer;font-weight:bold';
+  var vol = document.createElement('input');
+  vol.type = 'range'; vol.min = 0; vol.max = 1; vol.step = 0.05; vol.value = 1; vol.style.width = '70px';
+  vol.oninput = function () { a.volume = +vol.value; };
+  bar.appendChild(btn); bar.appendChild(vol);
+  document.body.appendChild(bar);
+
+  function paint() {
+    btn.textContent = on ? 'Mute Audio' : 'Enable Audio';
+    btn.style.background = on ? '#dc2626' : '#2563eb';
+  }
+  function remember(v) { try { localStorage.setItem(KEY, v ? '1' : '0'); } catch (e) {} }
+
+  function start() {
+    clearTimeout(timer);
+    on = true; paint();
+    a.src = '/audio.ogg?t=' + Date.now();
+    a.play().catch(function () { on = false; paint(); });
+  }
+  function stop() {
+    on = false; clearTimeout(timer); paint();
+    a.pause(); a.removeAttribute('src'); a.load();   // closes the HTTP stream -> server kills encoder
+  }
+  btn.onclick = function () { if (on) { stop(); remember(false); } else { start(); remember(true); } };
+
+  // Auto-reconnect the stream if it drops
+  function drop() {
+    if (!on) return;
+    clearTimeout(timer);
+    timer = setTimeout(start, Math.min(1000 * ++retry, 5000));
+  }
+  a.onerror = drop; a.onended = drop; a.onstalled = drop;
+  a.onplaying = function () { retry = 0; };
+
+  // Stay near the live edge (browsers buffer live streams and drift behind)
+  setInterval(function () {
+    if (!on || !a.buffered.length) return;
+    var end = a.buffered.end(a.buffered.length - 1);
+    if (end - a.currentTime > 1.5) a.currentTime = end - 0.3;
+  }, 2000);
+
+  // If audio was on last time, resume on the first click/keypress (autoplay policy needs a gesture)
+  var wasOn = false;
+  try { wasOn = localStorage.getItem(KEY) === '1'; } catch (e) {}
+  if (wasOn) {
+    var resume = function () {
+      document.removeEventListener('pointerdown', resume, true);
+      document.removeEventListener('keydown', resume, true);
+      if (!on) start();
+    };
+    document.addEventListener('pointerdown', resume, true);
+    document.addEventListener('keydown', resume, true);
+  }
+  paint();
+})();
+JSEOF
+
+RUN sed -i 's#</body>#<script src="audio.js"></script></body>#' /usr/share/novnc/vnc.html
+
+# ---------- Supervisor + web/audio/websocket front door ----------
+RUN cat << 'PYEOF' > /server.py
+import os, subprocess, threading, time, socket, select, signal, sys, glob
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 NOVNC_DIR = "/usr/share/novnc"
 PORT = int(os.environ.get("PORT", 8080))
 RES = os.environ.get("RESOLUTION", "800x480x16")
-WIN_W, WIN_H = RES.split("x")[0], RES.split("x")[1]
+_p = RES.split("x")
+WIN_W, WIN_H = _p[0], _p[1]
+DEPTH = _p[2] if len(_p) > 2 else "16"
 START_URL = os.environ.get("START_URL", "https://app.speechify.com")
+RATE = "24000"  # a native Opus rate -> no resampling
 
-# Inject floating audio player bar into vnc.html
-vnc_html = os.path.join(NOVNC_DIR, "vnc.html")
-with open(vnc_html, "r", encoding="utf-8") as f:
-    html = f.read()
+ENV = os.environ.copy()
+ENV.update({"DISPLAY": ":0", "HOME": "/root", "PULSE_SERVER": "unix:/tmp/pulse-socket"})
 
-audio_widget = """
-<div id="audio-bar" style="position:fixed;bottom:10px;right:10px;z-index:9999;background:#1e1e1e;color:#fff;padding:6px 12px;border-radius:6px;font-family:sans-serif;font-size:13px;box-shadow:0 2px 6px rgba(0,0,0,0.4);">
-  <button id="audio-btn" onclick="toggleAudio()" style="background:#2563eb;color:#fff;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-weight:bold;">Enable Audio</button>
-  <audio id="vnc-audio" preload="none"></audio>
-</div>
-<script>
-let playing = false;
-function toggleAudio() {
-  const a = document.getElementById('vnc-audio');
-  const b = document.getElementById('audio-btn');
-  if (!playing) {
-    a.src = '/audio.mp3?t=' + Date.now();
-    a.play();
-    b.textContent = 'Mute Audio';
-    b.style.background = '#dc2626';
-    playing = true;
-  } else {
-    a.pause();
-    a.src = '';
-    b.textContent = 'Enable Audio';
-    b.style.background = '#2563eb';
-    playing = false;
-  }
-}
-</script>
-</body>
-"""
-if 'id="audio-bar"' not in html:
-    with open(vnc_html, "w", encoding="utf-8") as f:
-        f.write(html.replace("</body>", audio_widget))
+X_SOCK = "/tmp/.X11-unix/X0"
+PULSE_SOCK = "/tmp/pulse-socket"
+CHROME_DIR = "/root/.config/chromium"
 
-# Lightweight process supervisor (replaces supervisord to save ~18MB RAM)
+# (name, command, wait-for paths, stale files to remove before each (re)start)
 PROCS = [
     ("pulseaudio", [
-        "/usr/bin/pulseaudio", "--daemonize=no", "--exit-idle-time=-1",
-        "--default-sample-rate=22050", "--default-sample-channels=1",
+        "/usr/bin/pulseaudio", "-n", "--daemonize=no", "--exit-idle-time=-1",
+        "--realtime=no", "--high-priority=no", "--disable-shm=yes",
+        f"--default-sample-rate={RATE}", "--default-sample-channels=1",
         "--resample-method=trivial",
-        "--load=module-native-protocol-unix socket=/tmp/pulse-socket auth-anonymous=1",
-        "--load=module-null-sink sink_name=virtual_speaker sink_properties=device.description=Virtual_Speaker"
-    ]),
-    ("xvfb", ["/usr/bin/Xvfb", ":0", "-screen", "0", RES, "-nolisten", "tcp"]),
-    ("x11vnc", [
-        "/usr/bin/x11vnc", "-display", ":0", "-rfbauth", "/root/.vnc/passwd",
-        "-forever", "-shared", "-rfbport", "5900",
-        "-wait", "100", "-defer", "100", "-ncache", "0",
-        "-noxdamage", "-noxrecord", "-nodpms", "-noscr", "-nolookup"
-    ]),
-    ("websockify", ["/usr/bin/websockify", "127.0.0.1:6080", "localhost:5900"]),
+        f"--load=module-native-protocol-unix socket={PULSE_SOCK} auth-anonymous=1",
+        f"--load=module-null-sink sink_name=virtual_speaker rate={RATE} channels=1 "
+        "sink_properties=device.description=Virtual_Speaker",
+    ], [], [PULSE_SOCK]),
+    ("xvnc", [
+        "/usr/bin/Xvnc", ":0", "-geometry", f"{WIN_W}x{WIN_H}", "-depth", DEPTH,
+        "-rfbport", "5900", "-rfbauth", "/root/.vnc/passwd",
+        "-SecurityTypes", "VncAuth", "-localhost", "-AlwaysShared",
+        "-FrameRate", "20", "-nolisten", "tcp",
+    ], [], ["/tmp/.X0-lock", X_SOCK]),
+    ("websockify", ["/usr/bin/websockify", "127.0.0.1:6080", "127.0.0.1:5900"], [], []),
     ("browser", [
         "/usr/bin/chromium-browser",
-        "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-zygote",
+        "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--in-process-gpu", "--no-zygote",
+        "--enable-low-end-device-mode",
         "--renderer-process-limit=1",
+        "--autoplay-policy=no-user-gesture-required",
         "--disable-background-timer-throttling", "--disable-background-networking",
         "--disable-extensions", "--disable-sync", "--disable-translate",
-        "--disable-features=Translate,BackForwardCache,MediaRouter,OptimizationHints,CalculateNativeWinOcclusion",
+        "--disable-component-update", "--disable-breakpad", "--disable-crash-reporter",
+        "--disable-domain-reliability", "--metrics-recording-only",
+        "--disable-smooth-scrolling", "--force-device-scale-factor=1",
+        "--overscroll-history-navigation=0",
+        "--disable-features=Translate,BackForwardCache,MediaRouter,OptimizationHints,"
+        "CalculateNativeWinOcclusion,IsolateOrigins,site-per-process,AudioServiceOutOfProcess",
         "--no-first-run", "--password-store=basic",
-        "--user-data-dir=/root/.config/chromium",
+        f"--user-data-dir={CHROME_DIR}",
         "--disk-cache-dir=/tmp/chromium-cache", "--disk-cache-size=10485760",
-        f"--window-position=0,0", f"--window-size={WIN_W},{WIN_H}",
+        "--window-position=0,0", f"--window-size={WIN_W},{WIN_H}",
         f"--app={START_URL}",
-        "--js-flags=--max-old-space-size=128"
-    ])
+        "--js-flags=--max-old-space-size=256",
+    ], [X_SOCK, PULSE_SOCK], [
+        f"{CHROME_DIR}/SingletonLock", f"{CHROME_DIR}/SingletonSocket", f"{CHROME_DIR}/SingletonCookie",
+    ]),
 ]
 
 running = []
 stopping = False
 
-def supervise(name, cmd):
-    env = os.environ.copy()
-    env.update({"DISPLAY": ":0", "HOME": "/root", "PULSE_SERVER": "unix:/tmp/pulse-socket", "MALLOC_ARENA_MAX": "2"})
+
+def wait_for(path, timeout=30):
+    end = time.time() + timeout
+    while time.time() < end and not os.path.exists(path):
+        time.sleep(0.1)
+
+
+def supervise(name, cmd, waits, stale):
     while not stopping:
-        p = subprocess.Popen(cmd, env=env)
+        for w in waits:
+            wait_for(w)
+        for pat in stale:
+            for f in glob.glob(pat):
+                try: os.remove(f)
+                except OSError: pass
+        p = subprocess.Popen(cmd, env=ENV)
         running.append(p)
         p.wait()
         if p in running:
             running.remove(p)
         if not stopping:
             time.sleep(1)
+
 
 def shutdown(signum, frame):
     global stopping
@@ -117,12 +190,20 @@ def shutdown(signum, frame):
         except Exception: pass
     sys.exit(0)
 
+
 signal.signal(signal.SIGTERM, shutdown)
 signal.signal(signal.SIGINT, shutdown)
 
-for name, cmd in PROCS:
-    threading.Thread(target=supervise, args=(name, cmd), daemon=True).start()
-    time.sleep(0.4)
+for name, cmd, waits, stale in PROCS:
+    threading.Thread(target=supervise, args=(name, cmd, waits, stale), daemon=True).start()
+    time.sleep(0.2)
+
+
+def nodelay(*socks):
+    for s in socks:
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
 
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
@@ -131,52 +212,71 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/":
             self.send_response(302)
-            self.send_header("Location", "/vnc.html?autoconnect=true&resize=scale")
+            self.send_header(
+                "Location",
+                "/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000&show_dot=true")
             self.end_headers()
             return
 
-        if self.path.startswith("/audio.mp3"):
+        if self.path.startswith("/audio"):
             self.send_response(200)
-            self.send_header("Content-Type", "audio/mpeg")
-            self.send_header("Cache-Control", "no-cache, no-store")
+            self.send_header("Content-Type", "audio/ogg")
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            cmd = [
-                "ffmpeg", "-loglevel", "quiet", "-threads", "1",
-                "-f", "pulse", "-i", "virtual_speaker.monitor",
-                "-ac", "1", "-ar", "22050", "-b:a", "48k", "-compression_level", "9",
-                "-f", "mp3", "-"
-            ]
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+            nodelay(self.connection)
+            rec = subprocess.Popen(
+                ["parec", "--device=virtual_speaker.monitor", "--format=s16le",
+                 f"--rate={RATE}", "--channels=1", "--latency-msec=40"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=ENV)
+            enc = subprocess.Popen(
+                ["opusenc", "--quiet", "--raw", "--raw-bits", "16", "--raw-rate", RATE,
+                 "--raw-chan", "1", "--speech", "--bitrate", "24", "--comp", "3",
+                 "--max-delay", "100", "-", "-"],
+                stdin=rec.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            rec.stdout.close()
+            fd = enc.stdout.fileno()
             try:
                 while True:
-                    chunk = proc.stdout.read(2048)
-                    if not chunk: break
+                    chunk = os.read(fd, 4096)   # returns as soon as any data is ready
+                    if not chunk:
+                        break
                     self.wfile.write(chunk)
                     self.wfile.flush()
-            except Exception:
+            except OSError:
                 pass
             finally:
-                proc.kill()
+                for p in (enc, rec):
+                    try: p.kill()
+                    except Exception: pass
+                    p.wait()
             return
 
         if self.headers.get("Upgrade", "").lower() == "websocket":
-            upstream = socket.create_connection(("127.0.0.1", 6080))
-            req_line = f"{self.command} {self.path} {self.request_version}\r\n".encode()
-            headers = b"".join(f"{k}: {v}\r\n".encode() for k, v in self.headers.items()) + b"\r\n"
-            upstream.sendall(req_line + headers)
+            self.close_connection = True
             client = self.connection
-            while True:
-                r, _, _ = select.select([client, upstream], [], [], 60)
-                if not r: break
-                if client in r:
-                    data = client.recv(8192)
-                    if not data: break
-                    upstream.sendall(data)
-                if upstream in r:
-                    data = upstream.recv(8192)
-                    if not data: break
-                    client.sendall(data)
-            upstream.close()
+            try:
+                upstream = socket.create_connection(("127.0.0.1", 6080), timeout=5)
+            except OSError:
+                self.send_error(502)
+                return
+            upstream.settimeout(None)
+            nodelay(client, upstream)
+            try:
+                req_line = f"{self.command} {self.path} {self.request_version}\r\n".encode()
+                headers = b"".join(f"{k}: {v}\r\n".encode() for k, v in self.headers.items()) + b"\r\n"
+                upstream.sendall(req_line + headers)
+                while True:
+                    # no idle timeout: a static screen sends nothing for long stretches
+                    r, _, _ = select.select([client, upstream], [], [])
+                    for s in r:
+                        data = s.recv(65536)
+                        if not data:
+                            return
+                        (upstream if s is client else client).sendall(data)
+            except OSError:
+                pass
+            finally:
+                upstream.close()
             return
 
         super().do_GET()
@@ -184,29 +284,34 @@ class Handler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
-EOF
 
-ENV DISPLAY=:0 \
-    RESOLUTION=800x480x16 \
+ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+PYEOF
+
+ENV RESOLUTION=800x480x16 \
     PORT=8080 \
     VNC_PASSWORD=changeme \
-    START_URL=https://app.speechify.com
+    START_URL=https://app.speechify.com \
+    PYTHONUNBUFFERED=1
 
-RUN cat << 'EOF' > /entrypoint.sh
-#!/bin/bash
+RUN cat << 'SHEOF' > /entrypoint.sh
+#!/bin/sh
 set -e
 mkdir -p /root/.vnc /tmp/chromium-cache /root/.config/chromium/Default
-x11vnc -storepasswd "$VNC_PASSWORD" /root/.vnc/passwd
+# VNC auth only uses the first 8 characters of the password
+printf '%s' "$VNC_PASSWORD" | vncpasswd -f > /root/.vnc/passwd
+chmod 600 /root/.vnc/passwd
 
 if [ -n "$SESSION_B64" ]; then
     echo "$SESSION_B64" | base64 -d | tar -xzf - -C /root/.config/chromium/Default 2>/dev/null || true
 fi
 
-exec /sbin/tini -- /usr/bin/python3 /server.py
-EOF
+exec /sbin/tini -- /usr/bin/python3 -O /server.py
+SHEOF
 
 RUN chmod +x /entrypoint.sh
+
+HEALTHCHECK --interval=60s --timeout=5s CMD wget -q --spider http://127.0.0.1:${PORT}/vnc.html || exit 1
 
 EXPOSE 8080
 ENTRYPOINT ["/entrypoint.sh"]
