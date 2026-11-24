@@ -89,7 +89,7 @@ RUN cat << 'JSEOF' > /usr/share/novnc/audio.js
 })();
 JSEOF
 
-RUN sed -i 's#</body>#<script src="audio.js"></script></body>#' /usr/share/novnc/vnc.html
+RUN sed -i 's#</body>#<script defer src="audio.js"></script></body>#' /usr/share/novnc/vnc.html
 
 # ---------- Supervisor + web/audio/websocket front door ----------
 RUN cat << 'PYEOF' > /server.py
@@ -219,7 +219,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.end_headers()
             return
 
-        if self.path.startswith("/audio"):
+        if self.path.split("?")[0] == "/audio.ogg":
             self.send_response(200)
             self.send_header("Content-Type", "audio/ogg")
             self.send_header("Cache-Control", "no-store")
